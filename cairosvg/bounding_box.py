@@ -343,7 +343,15 @@ def bounding_box_use(surface, node):
         unsafe=node.unsafe)
     if not match_features(tree.xml_tree):
         return None
-    return calculate_bounding_box(surface, tree)
+    bounding_box = calculate_bounding_box(surface, tree)
+    if is_valid_bounding_box(bounding_box):
+        # The referenced tree is drawn translated by the ``x`` and ``y``
+        # attributes of the ``use`` element
+        x, y, width, height = bounding_box
+        x += size(surface, node.get('x'), 'x')
+        y += size(surface, node.get('y'), 'y')
+        bounding_box = x, y, width, height
+    return bounding_box
 
 
 def extend_bounding_box(bounding_box, points):
@@ -385,13 +393,16 @@ BOUNDING_BOX_METHODS = {
     'rect': bounding_box_rect,
     'circle': bounding_box_circle,
     'ellipse': bounding_box_ellipse,
+    'image': bounding_box_rect,
     'line': bounding_box_line,
     'polyline': bounding_box_polyline,
     'polygon': bounding_box_polyline,
     'path': bounding_box_path,
+    'svg': bounding_box_rect,
     'text': bounding_box_text,
     'tspan': bounding_box_text,
     'textPath': bounding_box_text,
+    'a': bounding_box_text,
     'g': bounding_box_group,
     'use': bounding_box_use,
     'marker': bounding_box_group,

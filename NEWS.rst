@@ -3,6 +3,21 @@
 ======
 
 
+Unreleased
+==========
+
+* Fix ``clipPath`` with ``clipPathUnits="objectBoundingBox"`` on circles,
+  ellipses, paths, polygons, texts and uses: use the real geometric bounding
+  box of the clipped element (ink bounding box for texts, ``x``/``y`` offset
+  included for uses) instead of crashing with an invalid matrix error
+* Treat a degenerate bounding box as an empty clipping path instead of
+  crashing
+* Handle ``clip-rule="evenodd"`` (including inherited and styled values) when
+  clipping
+* Handle ``clip-path`` on the content of a ``clipPath`` by intersecting the
+  clipping paths, and never paint the content of a ``clipPath``
+
+
 Version 2.9.1 released on 2026-09-07
 ====================================
 

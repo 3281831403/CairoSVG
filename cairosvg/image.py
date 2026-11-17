@@ -21,6 +21,10 @@ IMAGE_RENDERING = {
 
 def image(surface, node):
     """Draw an image ``node``."""
+    if not surface.stroke_and_fill:
+        # Don't paint anything, the image is part of a clipping path
+        return
+
     base_url = node.get('{http://www.w3.org/XML/1998/namespace}base')
     if not base_url and node.url:
         base_url = os.path.dirname(node.url) + '/'

@@ -5,9 +5,11 @@ Cairo surface creators.
 
 import copy
 import io
+from math import ceil
 
 import cairocffi as cairo
 
+from .bounding_box import calculate_bounding_box, is_non_empty_bounding_box
 from .colors import color, negate_color
 from .defs import (
     apply_filter_after_painting, apply_filter_before_painting, clip_path,
@@ -185,6 +187,7 @@ class Surface(object):
         self.dpi = dpi
         self.font_size = size(self, '12pt')
         self.stroke_and_fill = True
+        self.silhouette = False
         width, height, viewbox = node_format(self, tree)
         if viewbox is None:
             viewbox = (0, 0, width, height)
@@ -376,28 +379,51 @@ class Surface(object):
             self.context.restore()
             self.context.clip()
         clip_path = parse_url(node.get('clip-path')).fragment
+        clip_mask = None
         if clip_path:
             path = self.paths.get(clip_path)
             if path:
-                self.context.save()
-                if path.get('clipPathUnits') == 'objectBoundingBox':
-                    x = size(self, node.get('x'), 'x')
-                    y = size(self, node.get('y'), 'y')
-                    width = size(self, node.get('width'), 'x')
-                    height = size(self, node.get('height'), 'y')
-                    self.context.translate(x, y)
-                    self.context.scale(width, height)
-                path.tag = 'g'
-                self.stroke_and_fill = False
-                self.draw(path)
-                self.stroke_and_fill = True
-                path.tag = 'clipPath'
-                self.context.restore()
-                # TODO: fill rules are not handled by cairo for clips
-                # if node.get('clip-rule') == 'evenodd':
-                #     self.context.set_fill_rule(cairo.FILL_RULE_EVEN_ODD)
-                self.context.clip()
-                self.context.set_fill_rule(cairo.FILL_RULE_WINDING)
+                object_bounding_box = (
+                    path.get('clipPathUnits') == 'objectBoundingBox')
+                if object_bounding_box:
+                    if node.tag in TAGS and TAGS[node.tag] == text:
+                        # The bounding box of a text is the bounding box of
+                        # the ink of its glyphs
+                        bounding_box = text_ink_bounding_box(self, node)
+                    else:
+                        bounding_box = calculate_bounding_box(self, node)
+                else:
+                    bounding_box = None
+                if object_bounding_box and not is_non_empty_bounding_box(
+                        bounding_box):
+                    # Empty or degenerate bounding box: the clipping path is
+                    # empty, nothing of the node is drawn
+                    self.context.new_path()
+                    self.context.clip()
+                elif clip_path_contains_clip(path):
+                    # The clipping path's content is itself clipped: cairo
+                    # clips cannot be intersected, so draw the content on a
+                    # temporary surface used as a mask when painting the node
+                    clip_mask = draw_clip_mask(
+                        self, path, bounding_box)
+                    self.context.push_group()
+                else:
+                    self.context.save()
+                    if object_bounding_box:
+                        x, y, width, height = bounding_box
+                        self.context.translate(x, y)
+                        self.context.scale(width, height)
+                    path.tag = 'g'
+                    stroke_and_fill = self.stroke_and_fill
+                    self.stroke_and_fill = False
+                    self.draw(path)
+                    self.stroke_and_fill = stroke_and_fill
+                    path.tag = 'clipPath'
+                    self.context.restore()
+                    if clip_fill_rule(path) == 'evenodd':
+                        self.context.set_fill_rule(cairo.FILL_RULE_EVEN_ODD)
+                    self.context.clip()
+                    self.context.set_fill_rule(cairo.FILL_RULE_WINDING)
 
         save_cursor = copy.deepcopy(
             (self.cursor_position, self.cursor_d_position,
@@ -436,7 +462,22 @@ class Surface(object):
         self.context.set_font_options(font_options)
 
         # Fill and stroke
-        if self.stroke_and_fill and visible and node.tag in TAGS:
+        if self.silhouette and visible and node.tag in TAGS:
+            # Only draw the silhouette of the node with an opaque paint:
+            # used to render the content of a clipping path as a mask
+            self.context.save()
+            if node.get('clip-rule') == 'evenodd':
+                self.context.set_fill_rule(cairo.FILL_RULE_EVEN_ODD)
+            self.context.set_source_rgba(0, 0, 0, 1)
+            if TAGS[node.tag] == text:
+                self.cursor_position = save_cursor[0]
+                self.cursor_d_position = save_cursor[1]
+                self.text_path_width = save_cursor[2]
+                text(self, node, draw_as_text=True)
+            else:
+                self.context.fill()
+            self.context.restore()
+        elif self.stroke_and_fill and visible and node.tag in TAGS:
             # Fill
             self.context.save()
             paint_source, paint_color = paint(node.get('fill', 'black'))
@@ -475,6 +516,15 @@ class Surface(object):
         if display and node.tag not in INVISIBLE_TAGS:
             for child in node.children:
                 self.draw(child)
+
+        # Apply the clipping path drawn as a mask
+        if clip_mask is not None:
+            self.context.pop_group_to_source()
+            self.context.get_source().set_matrix(cairo.Matrix())
+            self.context.save()
+            self.context.set_matrix(cairo.Matrix())
+            self.context.mask_surface(clip_mask, 0, 0)
+            self.context.restore()
 
         # Apply filter, mask and opacity
         if filter_ or mask or (opacity < 1 and node.children):
@@ -547,6 +597,89 @@ class SVGSurface(Surface):
     """
     device_units_per_user_units = 1
     surface_class = cairo.SVGSurface
+
+
+def clip_fill_rule(node, rule='nonzero'):
+    """Get the fill rule to use when clipping with ``node``'s content.
+
+    The ``clip-rule`` property is inherited by the children of the clipping
+    path. Cairo applies a single fill rule when clipping, use the last one
+    found in document order.
+
+    """
+    rule = node.get('clip-rule', rule)
+    for child in node.children:
+        rule = clip_fill_rule(child, rule)
+    return rule
+
+
+def clip_path_contains_clip(node):
+    """Check whether ``node``'s content uses clipping paths itself."""
+    if parse_url(node.get('clip-path')).fragment:
+        return True
+    return any(clip_path_contains_clip(child) for child in node.children)
+
+
+def draw_clip_mask(surface, clip_node, bounding_box):
+    """Draw ``clip_node``'s content as a mask, return the mask surface.
+
+    ``bounding_box`` is the ``(x, y, width, height)`` tuple of the clipped
+    node when the clipping path uses ``objectBoundingBox`` units, else
+    ``None``.
+
+    """
+    if isinstance(surface.cairo, cairo.ImageSurface):
+        mask_width = surface.cairo.get_width()
+        mask_height = surface.cairo.get_height()
+    else:
+        mask_width = int(ceil(surface.width))
+        mask_height = int(ceil(surface.height))
+    mask_surface = cairo.ImageSurface(
+        cairo.FORMAT_ARGB32, mask_width, mask_height)
+    mask_context = cairo.Context(mask_surface)
+    matrix = surface.context.get_matrix()
+    if bounding_box is not None:
+        x, y, width, height = bounding_box
+        bounding_box_matrix = cairo.Matrix()
+        bounding_box_matrix.translate(x, y)
+        bounding_box_matrix.scale(width, height)
+        matrix = matrix.multiply(bounding_box_matrix)
+    mask_context.set_matrix(matrix)
+
+    # Draw the clipping path content on the mask surface, with the same
+    # state as the real surface but another context
+    mask_surface_obj = copy.copy(surface)
+    mask_surface_obj.cairo = mask_surface
+    mask_surface_obj.context = mask_context
+    mask_surface_obj.stroke_and_fill = True
+    mask_surface_obj.silhouette = True
+    clip_node.tag = 'g'
+    mask_surface_obj.draw(clip_node)
+    clip_node.tag = 'clipPath'
+    return mask_surface
+
+
+def text_ink_bounding_box(surface, node):
+    """Get the bounding box of the ink of a text ``node``.
+
+    Draw the text without painting it and let cairo compute the extents of
+    the glyphs' paths.
+
+    """
+    cursor_position = list(surface.cursor_position)
+    cursor_d_position = list(surface.cursor_d_position)
+    text_path_width = surface.text_path_width
+    surface.context.save()
+    text(surface, node)
+    x1, y1, x2, y2 = surface.context.path_extents()
+    surface.context.restore()
+    surface.context.new_path()
+    surface.cursor_position = cursor_position
+    surface.cursor_d_position = cursor_d_position
+    surface.text_path_width = text_path_width
+    if x1 == x2 or y1 == y2:
+        return None
+    return x1, y1, x2 - x1, y2 - y1
 
 
 def parse_font(value):
